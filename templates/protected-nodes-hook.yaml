@@ -1,0 +1,60 @@
+{{- if .Values.protectedNodes.enabled }}
+# Post-install/upgrade hook: помечает перманентные ноды как защищённые от scale-down
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: protect-permanent-nodes
+  namespace: {{ .Values.namespace }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: 60
+  template:
+    spec:
+      serviceAccountName: node-finalizer-cleaner
+      restartPolicy: Never
+      tolerations:
+      - operator: Exists
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: hcloud/node-group
+                operator: DoesNotExist
+      containers:
+      - name: annotator
+        image: {{ .Values.finalizerCleaner.image }}
+        env:
+        - name: NODES
+          value: {{ .Values.protectedNodes.nodes | join "," | quote }}
+        command:
+        - python3
+        - -c
+        - |
+          import os, ssl, json, urllib.request
+          TOKEN = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+          CA    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+          HOST  = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+          PORT  = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+          BASE  = f"https://{HOST}:{PORT}"
+          ctx   = ssl.create_default_context(cafile=CA)
+
+          def patch(name):
+              body = {"metadata": {"annotations": {"cluster-autoscaler.kubernetes.io/scale-down-disabled": "true"}}}
+              req  = urllib.request.Request(f"{BASE}/api/v1/nodes/{name}", data=json.dumps(body).encode(), method="PATCH")
+              req.add_header("Authorization", f"Bearer {TOKEN}")
+              req.add_header("Content-Type", "application/merge-patch+json")
+              try:
+                  with urllib.request.urlopen(req, context=ctx):
+                      print(f"  protected {name}")
+              except Exception as e:
+                  print(f"  skip {name}: {e}")
+
+          for node in os.environ.get("NODES","").split(","):
+              if node.strip():
+                  patch(node.strip())
+{{- end }}

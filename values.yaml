@@ -1,0 +1,128 @@
+# ============================================================
+# hcloud Cluster Autoscaler + Rancher compatibility
+# ============================================================
+# Для деплоя с реальными данными используй values.local.yaml
+# Пример: helm upgrade --install -f values.yaml -f values.local.yaml ...
+
+namespace: cluster-autoscaler
+
+# ============================================================
+# Cluster Autoscaler
+# ============================================================
+autoscaler:
+  image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.32.0
+
+  # hcloud node groups: min/max/instanceType/region/name
+  nodeGroups:
+    - min: 1
+      max: 5
+      instanceType: cx23
+      region: fsn1
+      name: cx23-workers
+    - min: 0
+      max: 3
+      instanceType: cx33
+      region: fsn1
+      name: cx33-workers
+
+  # Параметры масштабирования
+  scaleDownUnneededTime: 5m
+  scaleDownDelayAfterAdd: 5m
+  skipNodesWithSystemPods: "false"
+  skipNodesWithLocalStorage: "false"
+  balanceSimilarNodeGroups: "true"
+  expander: least-waste
+  logLevel: 4
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 300Mi
+    limits:
+      cpu: 500m
+      memory: 500Mi
+
+# ============================================================
+# hcloud API конфигурация
+# Чувствительные данные — в values.local.yaml
+# ============================================================
+hcloud:
+  # hcloud API token — ОБЯЗАТЕЛЬНО переопределить в values.local.yaml
+  token: ""
+  region: fsn1
+  # Образ для новых нод
+  image: ubuntu-24.04
+  # Имя SSH ключа в hcloud (не fingerprint)
+  sshKey: ""
+  # Название private network в hcloud
+  network: ""
+
+  # cloud-init (base64) для каждого типа нод
+  # Генерация: cat cloud-init.yaml | base64 -w0
+  # Содержит: DNS, default route, rancher-join.sh, systemd unit
+  nodeGroups:
+    cx23-workers:
+      # cloud-init добавляет label: hcloud/node-group=cx23, node-type=cx23
+      # и регистрирует ноду в Rancher через system-agent
+      cloudInitBase64: ""
+    cx33-workers:
+      cloudInitBase64: ""
+
+# ============================================================
+# Node Finalizer Cleaner
+# Проблема: при удалении VM через hcloud autoscaler,
+# Rancher wrangler finalizers блокируют удаление node объекта.
+# Решение: CronJob снимает finalizers с нод помеченных
+# ToBeDeletedByClusterAutoscaler + unreachable > graceSeconds
+# ============================================================
+finalizerCleaner:
+  enabled: true
+
+  # Расписание — каждые 2 минуты
+  schedule: "*/2 * * * *"
+
+  # Сколько секунд нода должна быть unreachable до чистки
+  # Должно быть > времени graceful shutdown VM в hcloud (~60-120s)
+  graceSeconds: 300
+
+  # Python образ (нет зависимостей от kubectl)
+  # Скрипт использует k8s API напрямую через service account token
+  image: docker.io/library/python:3.12-alpine
+
+  # Запускать на нодах без hcloud/node-group label (VMware/bare-metal)
+  # Это гарантирует что cleaner не попадёт на ноду которую чистит
+  preferVMwareNodes: true
+
+# ============================================================
+# Rancher integration
+# После удаления k8s node — удаляет машину из Rancher UI
+# Без этого в Rancher висят Nodenotfound/Failed machine records
+# Получить токен: Rancher UI → Account & API Keys → Create API Key
+# ============================================================
+rancher:
+  # Включить чистку Rancher machine records
+  enabled: false
+  # URL Rancher (без слеша в конце)
+  url: ""
+  # API токен (Bearer)
+  token: ""
+  # ID кластера — найти в URL при открытии кластера в Rancher UI
+  # Пример: c-m-5g86mm7f
+  clusterId: ""
+
+# ============================================================
+# Protected Nodes
+# Post-install/upgrade hook: добавляет аннотацию
+# cluster-autoscaler.kubernetes.io/scale-down-disabled=true
+# на перманентные ноды (masters, VMware workers)
+# ============================================================
+protectedNodes:
+  enabled: true
+  nodes:
+    - k8s-master-1
+    - k8s-master-2
+    - k8s-master-5
+    - k8s-worker-6
+    - k8s-worker-7
+    - k8s-worker-8
+    - storage-hel1

@@ -1,0 +1,58 @@
+{{- if .Values.finalizerCleaner.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-finalizer-cleaner
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.finalizerCleaner.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: node-finalizer-cleaner
+          restartPolicy: Never
+          tolerations:
+          - operator: Exists
+          {{- if .Values.finalizerCleaner.preferVMwareNodes }}
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: hcloud/node-group
+                    operator: DoesNotExist
+          {{- end }}
+          containers:
+          - name: cleaner
+            image: {{ .Values.finalizerCleaner.image }}
+            env:
+            - name: GRACE_SECONDS
+              value: {{ .Values.finalizerCleaner.graceSeconds | quote }}
+            {{- if .Values.rancher.enabled }}
+            - name: RANCHER_URL
+              value: {{ .Values.rancher.url | quote }}
+            - name: RANCHER_CLUSTER_ID
+              value: {{ .Values.rancher.clusterId | quote }}
+            - name: RANCHER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rancher-api-token
+                  key: token
+            {{- end }}
+            command:
+            - python3
+            - /scripts/clean.py
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          volumes:
+          - name: scripts
+            configMap:
+              name: node-finalizer-cleaner-script
+{{- end }}

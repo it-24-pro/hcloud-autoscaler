@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: cluster-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cluster-autoscaler
+  template:
+    metadata:
+      labels:
+        app: cluster-autoscaler
+    spec:
+      serviceAccountName: cluster-autoscaler
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/etcd
+        effect: NoExecute
+      containers:
+      - name: cluster-autoscaler
+        image: {{ .Values.autoscaler.image }}
+        command:
+        - ./cluster-autoscaler
+        - --cloud-provider=hetzner
+        {{- range .Values.autoscaler.nodeGroups }}
+        - --nodes={{ .min }}:{{ .max }}:{{ .instanceType }}:{{ .region }}:{{ .name }}
+        {{- end }}
+        - --scale-down-unneeded-time={{ .Values.autoscaler.scaleDownUnneededTime }}
+        - --scale-down-delay-after-add={{ .Values.autoscaler.scaleDownDelayAfterAdd }}
+        - --skip-nodes-with-system-pods={{ .Values.autoscaler.skipNodesWithSystemPods }}
+        - --skip-nodes-with-local-storage={{ .Values.autoscaler.skipNodesWithLocalStorage }}
+        - --balance-similar-node-groups={{ .Values.autoscaler.balanceSimilarNodeGroups }}
+        - --expander={{ .Values.autoscaler.expander }}
+        - --v={{ .Values.autoscaler.logLevel }}
+        env:
+        - name: HCLOUD_CLOUD_CONFIG
+          value: /etc/hcloud/config.yaml
+        resources: {{ toYaml .Values.autoscaler.resources | nindent 10 }}
+        volumeMounts:
+        - name: hcloud-config
+          mountPath: /etc/hcloud
+          readOnly: true
+      volumes:
+      - name: hcloud-config
+        secret:
+          secretName: hcloud-autoscaler-config

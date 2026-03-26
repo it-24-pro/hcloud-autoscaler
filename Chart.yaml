@@ -1,0 +1,10 @@
+apiVersion: v2
+name: hcloud-autoscaler
+description: |
+  Полный стек hcloud Cluster Autoscaler для Rancher/RKE2.
+  Включает:
+  - cluster-autoscaler deployment (hetzner provider)
+  - node-finalizer-cleaner (снимает Rancher wrangler finalizers с удалённых нод)
+  - protected-nodes job (запрещает autoscaler трогать перманентные ноды)
+type: application
+version: 0.2.0

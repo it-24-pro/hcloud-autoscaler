@@ -1,0 +1,112 @@
+{{- if .Values.finalizerCleaner.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-finalizer-cleaner-script
+  namespace: {{ .Values.namespace }}
+data:
+  clean.py: |
+    import os, time, json, ssl, urllib.request, urllib.error
+    from datetime import datetime
+
+    TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    CA_FILE    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    API_HOST   = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    API_PORT   = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    BASE_URL   = f"https://{API_HOST}:{API_PORT}"
+    GRACE      = int(os.environ.get("GRACE_SECONDS", "300"))
+
+    RANCHER_URL        = os.environ.get("RANCHER_URL", "")
+    RANCHER_TOKEN      = os.environ.get("RANCHER_TOKEN", "")
+    RANCHER_CLUSTER_ID = os.environ.get("RANCHER_CLUSTER_ID", "")
+
+    with open(TOKEN_FILE) as f:
+        TOKEN = f.read().strip()
+    ctx = ssl.create_default_context(cafile=CA_FILE)
+
+    def api(method, path, body=None):
+        data = json.dumps(body).encode() if body else None
+        req  = urllib.request.Request(BASE_URL + path, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {TOKEN}")
+        req.add_header("Content-Type", "application/merge-patch+json")
+        try:
+            with urllib.request.urlopen(req, context=ctx) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            print(f"HTTP {e.code} {method} {path}: {e.read().decode()[:200]}")
+            return None
+
+    def rancher_delete_machine(node_name):
+        if not RANCHER_URL or not RANCHER_TOKEN or not RANCHER_CLUSTER_ID:
+            return
+        try:
+            no_verify_ctx = ssl.create_default_context()
+            no_verify_ctx.check_hostname = False
+            no_verify_ctx.verify_mode = ssl.CERT_NONE
+            # Найти machine по имени ноды
+            list_url = f"{RANCHER_URL}/v1/cluster.x-k8s.io.machines/fleet-default"
+            req = urllib.request.Request(list_url)
+            req.add_header("Authorization", f"Bearer {RANCHER_TOKEN}")
+            with urllib.request.urlopen(req, context=no_verify_ctx) as r:
+                machines = json.loads(r.read()).get("data", [])
+            machine_name = None
+            for m in machines:
+                infra = m.get("spec", {}).get("infrastructureRef", {})
+                node_ref = m.get("status", {}).get("nodeRef", {})
+                if node_ref.get("name") == node_name or infra.get("name","").endswith(node_name[-8:]):
+                    machine_name = m["metadata"]["name"]
+                    break
+            if not machine_name:
+                # fallback: ищем по имени ноды в metadata
+                for m in machines:
+                    if node_name in m["metadata"].get("name","") or node_name in str(m.get("spec",{})):
+                        machine_name = m["metadata"]["name"]
+                        break
+            if not machine_name:
+                print(f"  rancher: machine for {node_name} not found")
+                return
+            del_url = f"{RANCHER_URL}/v1/cluster.x-k8s.io.machines/fleet-default/{machine_name}"
+            req = urllib.request.Request(del_url, method="DELETE")
+            req.add_header("Authorization", f"Bearer {RANCHER_TOKEN}")
+            with urllib.request.urlopen(req, context=no_verify_ctx) as r:
+                print(f"  rancher: deleted machine {machine_name}")
+        except Exception as e:
+            print(f"  rancher: error for {node_name}: {e}")
+
+    nodes = api("GET", "/api/v1/nodes")
+    if not nodes:
+        raise SystemExit("Failed to list nodes")
+
+    now = time.time()
+    for node in nodes.get("items", []):
+        name       = node["metadata"]["name"]
+        taints     = [t["key"] for t in node["spec"].get("taints", [])]
+        finalizers = node["metadata"].get("finalizers", [])
+
+        # только ноды которые autoscaler пометил к удалению И unreachable
+        if "ToBeDeletedByClusterAutoscaler" not in taints: continue
+        if "node.kubernetes.io/unreachable"  not in taints: continue
+        if not finalizers: continue
+
+        ready = next((c for c in node["status"].get("conditions", []) if c["type"] == "Ready"), None)
+        if not ready: continue
+
+        try:
+            dt   = datetime.fromisoformat(ready["lastTransitionTime"].replace("Z", "+00:00"))
+            secs = now - dt.timestamp()
+        except Exception as e:
+            print(f"skip {name}: parse error {e}")
+            continue
+
+        if secs < GRACE:
+            print(f"skip {name}: unreachable {int(secs)}s < grace {GRACE}s")
+            continue
+
+        print(f"cleaning {name}: unreachable {int(secs)}s, finalizers={finalizers}")
+        if api("PATCH", f"/api/v1/nodes/{name}", {"metadata": {"finalizers": []}}):
+            api("DELETE", f"/api/v1/nodes/{name}")
+            print(f"  deleted {name}")
+            rancher_delete_machine(name)
+        else:
+            print(f"  failed to patch {name}")
+{{- end }}

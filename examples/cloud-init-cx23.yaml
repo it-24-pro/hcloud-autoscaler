@@ -1,0 +1,87 @@
+#cloud-config
+# cloud-init для hcloud cx23 worker нод
+# Регистрирует ноду в Rancher кластере через system-agent
+#
+# ИСПОЛЬЗОВАНИЕ:
+#   base64 -w0 cloud-init-cx23.yaml
+#   Вставить результат в values.local.yaml -> hcloud.nodeGroups.cx23-workers.cloudInitBase64
+
+write_files:
+  # DNS конфигурация (резолвер не берёт из DHCP по умолчанию)
+  - path: /etc/systemd/resolved.conf.d/dns.conf
+    content: |
+      [Resolve]
+      DNS=8.8.8.8 8.8.4.4
+      FallbackDNS=1.1.1.1
+
+  # Скрипт регистрации в Rancher
+  - path: /usr/local/bin/rancher-join.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      exec >> /var/log/rancher-join.log 2>&1
+      set -x
+      echo "=== START $(date) ==="
+
+      # Ждём появления интерфейса в private network (10.102.24.x)
+      for i in $(seq 1 60); do
+        IFACE=$(ip -o addr show | grep 'inet 10\.102\.' | awk '{print $2}' | head -1)
+        [ -n "$IFACE" ] && break
+        sleep 2
+      done
+      echo "Interface: $IFACE"
+
+      # Default route через private network gateway
+      ip route replace default via 10.102.24.1 dev "$IFACE" || true
+      systemctl restart systemd-resolved
+
+      # Получаем hcloud server ID для provider-id
+      SERVER_ID=$(curl -sf http://169.254.169.254/hetzner/v1/metadata/instance-id)
+      echo "Server ID: $SERVER_ID"
+
+      # RKE2 конфиг: provider-id и node labels
+      mkdir -p /etc/rancher/rke2
+      cat > /etc/rancher/rke2/config.yaml << RKEEOF
+      kubelet-arg:
+        - "provider-id=hcloud://${SERVER_ID}"
+      node-label:
+        - "node.kubernetes.io/instance-type=cx23"
+        - "hcloud/node-group=cx23-workers"
+      RKEEOF
+
+      # Чистим старые агент данные если есть (для idempotency)
+      rm -rf /var/lib/rancher/agent /etc/rancher/agent || true
+
+      # Регистрируем ноду через Rancher system-agent
+      # ЗАМЕНИТЬ: --server, --token, --ca-checksum на реальные значения
+      curl -fL https://RANCHER_URL/system-agent-install.sh | sh -s - \
+        --server https://RANCHER_URL \
+        --label 'cattle.io/os=linux' \
+        --token RANCHER_TOKEN \
+        --ca-checksum RANCHER_CA_CHECKSUM \
+        --worker
+
+      echo "=== DONE $(date) ==="
+
+  # systemd unit для однократного запуска при старте
+  - path: /etc/systemd/system/rancher-join.service
+    content: |
+      [Unit]
+      Description=Join Rancher cluster
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/var/lib/rancher/agent/.rancher-joined
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/rancher-join.sh
+      ExecStartPost=/bin/touch /var/lib/rancher/agent/.rancher-joined
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - mkdir -p /etc/systemd/resolved.conf.d /var/lib/rancher/agent
+  - systemctl daemon-reload
+  - systemctl enable --now rancher-join.service
